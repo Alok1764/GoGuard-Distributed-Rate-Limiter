@@ -161,12 +161,101 @@ func TestFixedWindowConcurrentExactLimit(t *testing.T) {
 	}
 }
 
+func TestFixedWindowEvictDropsIdleKeysOnly(t *testing.T) {
+	start := time.Date(2026, 9, 28, 10, 0, 0, 0, time.UTC)
+	clk := newFakeClock(start)
+	lim := mustFixed(t, 1, time.Second, clk)
+
+	mustAllow(t, lim, "alice")
+	mustAllow(t, lim, "bob")
+	if lim.Len() != 2 {
+		t.Fatalf("len = %d, want 2", lim.Len())
+	}
+	if n := lim.Evict(); n != 0 {
+		t.Fatalf("evicted %d live keys", n)
+	}
+
+	clk.Advance(time.Second)
+	// Alice enters the new bucket. Bob does not, so only Bob is idle.
+	mustAllow(t, lim, "alice")
+	if n := lim.Evict(); n != 1 {
+		t.Fatalf("evicted %d, want 1", n)
+	}
+	if lim.Len() != 1 {
+		t.Fatalf("len = %d, want 1", lim.Len())
+	}
+}
+
+func TestFixedWindowKeysDoNotShareALock(t *testing.T) {
+	// The first Now blocks. That call holds Alice's counter lock.
+	// Bob must finish anyway. If every key still shared one mutex, Bob
+	// would sit behind Alice until the gate opens.
+	start := time.Date(2026, 9, 28, 10, 0, 0, 0, time.UTC)
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	clk := &blockingClock{now: start, release: release, entered: entered}
+	lim := mustFixed(t, 1, time.Hour, clk)
+	defer close(release)
+
+	go func() {
+		_, _ = lim.Allow(context.Background(), "alice")
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("alice did not reach the clock")
+	}
+
+	bobDone := make(chan ratelimit.Decision)
+	bobErr := make(chan error, 1)
+	go func() {
+		d, err := lim.Allow(context.Background(), "bob")
+		if err != nil {
+			bobErr <- err
+			return
+		}
+		bobDone <- d
+	}()
+	select {
+	case err := <-bobErr:
+		t.Fatalf("bob: %v", err)
+	case d := <-bobDone:
+		if !d.Allowed {
+			t.Fatal("bob denied while alice was blocked")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bob waited on alice's lock")
+	}
+}
+
+// blockingClock stalls inside the first Now. Later calls return at once.
+// A sync.Once would stall those later calls too, and the test could no
+// longer tell a per-key lock from one shared lock.
+type blockingClock struct {
+	mu      sync.Mutex
+	now     time.Time
+	release <-chan struct{}
+	entered chan struct{}
+	once    atomic.Bool
+}
+
+func (b *blockingClock) Now() time.Time {
+	if b.once.CompareAndSwap(false, true) {
+		close(b.entered)
+		<-b.release
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.now
+}
+
 func mustFixed(t *testing.T, limit int, window time.Duration, clock ratelimit.Clock) *ratelimit.FixedWindow {
 	t.Helper()
 	lim, err := ratelimit.NewFixedWindow(limit, window, clock)
 	if err != nil {
 		t.Fatalf("new fixed window: %v", err)
 	}
+	t.Cleanup(lim.Close)
 	return lim
 }
 
