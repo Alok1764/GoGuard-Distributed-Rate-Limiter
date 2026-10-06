@@ -1,12 +1,12 @@
 # GoGuard interview notes
 
-This note matches the code that exists today: three in-memory limiters behind one `Allow` method, fixed window, sliding window log, and sliding window counter. Each key has its own mutex. A sweep deletes idle keys. Redis, the HTTP gateway, the token bucket, the leaky bucket, and metrics are not built yet. Saying they are finished is the answer that fails the interview.
+This note matches the code that exists today: four in-memory limiters behind one `Allow` method, fixed window, sliding window log, sliding window counter, and token bucket. Each key has its own mutex. A sweep deletes idle keys. Redis, the HTTP gateway, the leaky bucket, and metrics are not built yet. Saying they are finished is the answer that fails the interview.
 
 The invariant both limiters protect:
 
 > For one key, over the interval that limiter defines, the number of allowed calls is at most `limit`. A refusal tells the caller when a slot opens again.
 
-The interval is not the same thing in each algorithm. Fixed window uses an aligned bucket. The log uses the trailing window ending at `now`. The counter estimates that same trailing window from the previous bucket and the current bucket.
+The interval is not the same thing in each algorithm. Fixed window uses an aligned bucket. The log uses the trailing window ending at `now`. The counter estimates that same trailing window from the previous bucket and the current bucket. The token bucket is not a window: it spends a token and refills at a steady rate.
 
 ---
 
@@ -20,7 +20,8 @@ The interval is not the same thing in each algorithm. Fixed window uses an align
 | `FixedWindow` | `ratelimit/fixedwindow.go` | One counter per key per aligned bucket. The map lock only finds the pointer. The counter lock updates that key. `Evict` drops idle keys. `Close` stops the sweep. |
 | `SlidingWindowLog` | `ratelimit/slidinglog.go` | One timestamp per allowed call still inside the trailing window, at most `limit` of them. Same lock order and the same `Allow` result type. |
 | `SlidingWindowCounter` | `ratelimit/slidingcounter.go` | `prev` and `curr` bucket totals. Estimate is `prev * (window-elapsed) / window + curr`, computed with integer cross-multiplication. |
-| Tests | `ratelimit/*_test.go` | Fixed window, the log, and the counter: half of a full previous bucket still counts, a two-bucket gap clears `prev`, and the counter disagrees with the log when the previous bucket is clustered. |
+| `TokenBucket` | `ratelimit/tokenbucket.go` | `burst` tokens, refilled at `rate` per `per`. A new key starts full. Partial refill time is kept in `remainder`. |
+| Tests | `ratelimit/*_test.go` | The three window limiters, plus the token bucket: burst then one token at a time, refill capped at burst, a 50ms leftover, and eviction only of a full bucket. |
 
 A call is allowed when `count < limit`, then `count` becomes `count + 1`. A refused call does not change `count`. The bucket id is `now.Truncate(window)`, which is the start of the current window on the absolute clock, not the time of the first request.
 
@@ -78,7 +79,19 @@ The first version was correct and coarse. Two later changes replaced it. The alg
 
 **What it cost.** The weight assumes the previous bucket was spread evenly. `TestSlidingCounterDisagreesWithLogOnAClusteredPreviousBucket` fills a bucket and steps exactly one window: the log allows, because every hit has aged out, and the counter refuses, because the whole previous total still has weight 1. `TestSlidingCounterOverAdmitsAgainstTheLog` puts the burst on the last nanosecond of the bucket and steps nine seconds into the next one: the log still sees those hits, and the counter allows. A two-bucket gap sets both counts to 0. Copying `curr` into `prev` across that gap would invent traffic.
 
-**What I did not do.** The token bucket and the leaky bucket. Those are a different promise: a burst size plus a steady rate, not a weighted pair of buckets.
+**What I did not do.** The leaky bucket. That is the other rate-shaped limiter: it refuses when the water would pass a line, instead of spending a saved token.
+
+### Change 5. A burst plus a rate, instead of a window
+
+**Before.** The three window limiters answer "how many calls fell in this interval?" A second burst in the fixed window is an accident of the bucket edge. The log and the counter argue about that interval. None of them has a knob that means "you may take 20 at once, then only 10 per second."
+
+**After.** `TokenBucket` stores whole tokens, a leftover duration, and the last update. A new key starts at `burst`. `Allow` adds `elapsed * rate / per` whole tokens, caps at `burst`, and spends one. The division leftover stays in `remainder`. `TestTokenBucketKeepsThePartialToken` waits 250ms at 10 tokens per second and gets 2 tokens, then a refusal whose `Retry-After` is 50ms. There is no ticker goroutine per key.
+
+**Why.** The burst is configured. Refill on the next call is the same math as a ticker, without one goroutine per caller.
+
+**What it cost.** `tokens` and `remainder` move together, so the key mutex stays. A restart starts every key full, which is a free burst on deploy. `Evict` deletes only a bucket that is already full. Deleting an empty one would create a new full bucket and hand the caller the burst again.
+
+**What I did not do.** The leaky bucket meter. A token bucket allows the burst up front. The meter is the version that refuses to let the level pass a line.
 
 ---
 
@@ -214,11 +227,11 @@ Also skip the limiter on `/healthz` and `/metrics`. A scraper that receives 429 
 | Fixed window | One integer and a bucket start | Cheap. Up to about `2 * limit` at the bucket edge. | Coarse quotas. Implemented. |
 | Sliding window log | Up to `limit` timestamps, oldest first | Accurate over the true last window. A slot frees when the oldest hit ages out, not when a bucket rolls. | Small limits. Implemented. A limit of 100,000 stores up to 100,000 timestamps per key. |
 | Sliding window counter | Previous bucket count and current bucket count | Estimate is `previous * overlap + current`. O(1) memory. The estimate can sit over or under the true count when the previous bucket is clustered. | The usual production compromise. Implemented. |
-| Token bucket | Tokens and last refill time | Burst up to capacity, then a steady refill rate. Refill is computed on the next call from elapsed time, so there is no ticker goroutine per key. | "100 per second, with a burst of 200." |
+| Token bucket | Whole tokens, leftover refill time, and the last update | Burst up to capacity, then a steady refill. Refill is computed on the next call. No ticker per key. | "10 per second, with a burst of 20." Implemented. |
 | Leaky bucket, as a meter | Water level and last leak time | Level rises by one per allow and leaks at a constant rate. Reject when it would pass capacity. This shape is the dual of a token bucket. | Policing: refuse, do not queue. |
 | Leaky bucket, as a queue | A queue of waiting requests | Output toward the backend is smooth. If the queue is full, reject. | Shaping: I need to delay, not only refuse. `Allow` today returns immediately, so the meter fits the interface. The queue is a different API. |
 
-The token bucket and both leaky-bucket forms are not implemented. Claiming them is a false answer.
+Both leaky-bucket forms are not implemented. Claiming them is a false answer.
 
 ### Q21. Multi-region. Can you keep one global strict limit and stay fast?
 
@@ -323,7 +336,7 @@ There is no 429, no `Retry-After` header, no proxy, no metrics. `Decision.RetryA
 - "Why not atomics?" The bucket id and the count move together.
 - "Why not `sync.Map`?" The hot path updates a counter. The map is a colder problem.
 - "Where can this over-admit?" The fixed window, at the bucket boundary. The log does not, inside one process. Both do after a restart, and both do once per process if I run more than one process.
-- "What will you build next?" The token bucket, then the leaky bucket meter, each behind the same `Allow`. Striped map locks only after a benchmark shows the map lock waiting. The gateway comes after the algorithm set is real.
+- "What will you build next?" The leaky bucket meter, behind the same `Allow`. Striped map locks only after a benchmark shows the map lock waiting. The gateway comes after the algorithm set is real.
 
 ---
 
