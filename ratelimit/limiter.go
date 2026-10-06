@@ -17,6 +17,9 @@ var (
 	ErrInvalidWindow = errors.New("ratelimit: window must be positive")
 	// ErrEmptyKey is returned when Allow is called without a caller identity.
 	ErrEmptyKey = errors.New("ratelimit: key must be non-empty")
+	// ErrOverflow is returned when limit and window are too large for an exact
+	// integer comparison in the sliding window counter.
+	ErrOverflow = errors.New("ratelimit: limit and window overflow an exact comparison")
 )
 
 // Decision is the outcome of one Allow call.
